@@ -174,6 +174,9 @@ class TriggererJobRunner(BaseJobRunner, LoggingMixin):
             raise
         finally:
             self.log.info("Waiting for triggers to clean up")
+            # Perform graceful shutdown before sending termination signals
+            if hasattr(self.trigger_runner, "graceful_shutdown"):
+                self.trigger_runner.graceful_shutdown(timeout=5.0)
             # Tell the subtproc to stop and then wait for it.
             # If the user interrupts/terms again, _graceful_exit will allow them
             # to force-kill here.
@@ -528,6 +531,54 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
                 self.heartbeat()
 
                 self.emit_metrics()
+
+    def graceful_shutdown(self, timeout: float = 5.0) -> None:
+        """
+        Perform graceful shutdown by waiting for pending operations to complete.
+
+        This method ensures that any pending trigger deletions are processed before
+        sending termination signals to the subprocess.
+
+        :param timeout: Maximum time to wait for operations to complete
+        """
+        if self.stop:
+            return
+
+        self.stop = True
+        start_time = time.monotonic()
+
+        # Wait for pending operations to complete
+        while time.monotonic() - start_time < timeout:
+            if not self.is_alive():
+                break
+
+            # Process any remaining subprocess communication
+            self._service_subprocess(0.1)
+
+            # Check if we have any pending operations
+            if (
+                not self.creating_triggers
+                and not self.cancelling_triggers
+                and not self.events
+                and not self.failed_triggers
+            ):
+                break
+
+            # Handle any remaining events
+            self.handle_events()
+            self.handle_failed_triggers()
+
+        # Log if we had to timeout
+        if time.monotonic() - start_time >= timeout:
+            log.warning(
+                "Graceful shutdown timed out after %.1f seconds. "
+                "Pending operations: creating=%d, cancelling=%d, events=%d, failed=%d",
+                timeout,
+                len(self.creating_triggers),
+                len(self.cancelling_triggers),
+                len(self.events),
+                len(self.failed_triggers),
+            )
 
     def heartbeat(self):
         perform_heartbeat(self.job, heartbeat_callback=self.heartbeat_callback, only_if_necessary=True)
@@ -1069,6 +1120,7 @@ class TriggerRunner:
         Unfortunately, we can't tell what trigger is blocking things, but
         we can at least detect the top-level problem.
         """
+        consecutive_blocked_count = 0
         while not self.stop:
             last_run = time.monotonic()
             await asyncio.sleep(0.1)
@@ -1076,13 +1128,32 @@ class TriggerRunner:
             # be a busy event loop.
             time_elapsed = time.monotonic() - last_run
             if time_elapsed > 0.2:
+                consecutive_blocked_count += 1
                 await self.log.ainfo(
                     "Triggerer's async thread was blocked for %.2f seconds, "
                     "likely by a badly-written trigger. Set PYTHONASYNCIODEBUG=1 "
-                    "to get more information on overrunning coroutines.",
+                    "to get more information on overrunning coroutines. "
+                    "Consecutive blocked count: %d",
                     time_elapsed,
+                    consecutive_blocked_count,
                 )
                 Stats.incr("triggers.blocked_main_thread")
+
+                # If we're consistently blocked, log a warning
+                if consecutive_blocked_count >= 5:
+                    await self.log.awarning(
+                        "Triggerer's async thread has been consistently blocked. "
+                        "This may indicate a problematic trigger that is blocking the event loop."
+                    )
+            else:
+                # Reset the counter if we're not blocked
+                if consecutive_blocked_count > 0:
+                    await self.log.ainfo(
+                        "Triggerer's async thread is no longer blocked. "
+                        "Previous consecutive blocked count: %d",
+                        consecutive_blocked_count,
+                    )
+                consecutive_blocked_count = 0
 
     async def run_trigger(self, trigger_id, trigger):
         """Run a trigger (they are async generators) and push their events into our outbound event deque."""
