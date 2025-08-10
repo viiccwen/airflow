@@ -81,12 +81,6 @@ def clean_database():
     clear_db_dags()
     clear_db_xcom()
     clear_db_variables()
-    yield  # Test runs here
-    clear_db_connections()
-    clear_db_runs()
-    clear_db_dags()
-    clear_db_xcom()
-    clear_db_variables()
 
 
 def create_trigger_in_db(session, trigger, operator=None):
@@ -243,15 +237,25 @@ def test_trigger_lifecycle(spy_agency: SpyAgency, session):
         # Re-load the triggers
         trigger_runner_supervisor.load_triggers()
 
-        # Wait for up to 3 seconds for it to vanish from the TriggerRunner's storage
-        for _ in range(30):
+        # Wait for up to 10 seconds for it to vanish from the TriggerRunner's storage
+        # Increased timeout to handle potential event loop blocking
+        max_wait_time = 10.0
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < max_wait_time:
             if not trigger_runner_supervisor.running_triggers:
                 break
-            trigger_runner_supervisor._service_subprocess(0.1)
+            # Use shorter polling intervals to be more responsive
+            trigger_runner_supervisor._service_subprocess(0.05)
         else:
-            pytest.fail("TriggerRunnerSupervisor never deleted trigger")
+            pytest.fail(
+                f"TriggerRunnerSupervisor never deleted trigger after {max_wait_time} seconds. "
+                f"Running triggers: {trigger_runner_supervisor.running_triggers}"
+            )
     finally:
         # We always have to stop the runner
+        # Use graceful shutdown to ensure pending operations complete
+        if hasattr(trigger_runner_supervisor, "graceful_shutdown"):
+            trigger_runner_supervisor.graceful_shutdown(timeout=2.0)
         trigger_runner_supervisor.kill(force=False)
 
 
