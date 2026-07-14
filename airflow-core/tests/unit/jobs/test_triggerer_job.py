@@ -2268,9 +2268,9 @@ def test_update_triggers_uses_fetch_hooks(session, supervisor_builder, mocker):
         fetch_trigger_details_calls.append((trigger_ids, session))
         return original_fetch_trigger_details(self, trigger_ids, session=session)
 
-    def fetch_non_task_trigger_ids(self, *, session):
-        fetch_non_task_trigger_ids_calls.append(session)
-        return original_fetch_non_task_trigger_ids(self, session=session)
+    def fetch_non_task_trigger_ids(self, trigger_ids, *, session):
+        fetch_non_task_trigger_ids_calls.append((trigger_ids, session))
+        return original_fetch_non_task_trigger_ids(self, trigger_ids, session=session)
 
     mocker.patch.object(
         TriggerRunnerSupervisor, "fetch_trigger_details", autospec=True, side_effect=fetch_trigger_details
@@ -2285,8 +2285,8 @@ def test_update_triggers_uses_fetch_hooks(session, supervisor_builder, mocker):
     supervisor.update_triggers({trigger_orm.id})
 
     assert len(fetch_trigger_details_calls) == 1
-    assert len(fetch_non_task_trigger_ids_calls) == 1
-    assert fetch_trigger_details_calls == [({trigger_orm.id}, fetch_non_task_trigger_ids_calls[0])]
+    assert fetch_non_task_trigger_ids_calls == fetch_trigger_details_calls
+    assert fetch_trigger_details_calls[0][0] == {trigger_orm.id}
     assert len(supervisor.creating_triggers) == 1
     assert supervisor.creating_triggers[0].id == trigger_orm.id
 

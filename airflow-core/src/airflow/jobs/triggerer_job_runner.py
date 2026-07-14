@@ -909,9 +909,9 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
         """Fetch trigger rows by ID."""
         return Trigger.bulk_fetch(trigger_ids, session=session)
 
-    def fetch_non_task_trigger_ids(self, *, session: Session) -> set[int]:
+    def fetch_non_task_trigger_ids(self, trigger_ids: set[int], *, session: Session) -> set[int]:
         """Fetch trigger IDs associated with non-task entities."""
-        return Trigger.fetch_trigger_ids_with_non_task_associations(session=session)
+        return Trigger.fetch_trigger_ids_with_non_task_associations(trigger_ids, session=session)
 
     def build_trigger_workloads(self, new_trigger_ids: set[int]) -> list[workloads.RunTrigger]:
         """Build workloads for new trigger IDs."""
@@ -919,7 +919,9 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
         render_log_fname = log_filename_template_renderer()
         with create_session() as session:
             new_triggers = self.fetch_trigger_details(new_trigger_ids, session=session)
-            trigger_ids_with_non_task_associations = self.fetch_non_task_trigger_ids(session=session)
+            trigger_ids_with_non_task_associations = self.fetch_non_task_trigger_ids(
+                new_trigger_ids, session=session
+            )
             to_create: list[workloads.RunTrigger] = []
             for new_trigger_id in new_trigger_ids:
                 # Check it didn't vanish in the meantime

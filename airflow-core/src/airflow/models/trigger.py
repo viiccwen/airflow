@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import datetime
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from enum import Enum
 from functools import singledispatch
 from traceback import format_exception
@@ -219,12 +219,20 @@ class Trigger(Base):
 
     @classmethod
     @provide_session
-    def fetch_trigger_ids_with_non_task_associations(cls, *, session: Session = NEW_SESSION) -> set[int]:
-        """Fetch all trigger IDs actively associated with non-task entities like assets and callbacks."""
+    def fetch_trigger_ids_with_non_task_associations(
+        cls, trigger_ids: Collection[int], *, session: Session = NEW_SESSION
+    ) -> set[int]:
+        """Fetch trigger IDs actively associated with non-task entities like assets and callbacks."""
         from airflow.models.callback import Callback  # to avoid circular import: Callback -> Trigger
 
-        query = select(AssetWatcherModel.trigger_id).union_all(
-            select(Callback.trigger_id).where(Callback.trigger_id.is_not(None))
+        query = (
+            select(AssetWatcherModel.trigger_id)
+            .where(AssetWatcherModel.trigger_id.in_(trigger_ids))
+            .union_all(
+                select(Callback.trigger_id).where(
+                    Callback.trigger_id.is_not(None), Callback.trigger_id.in_(trigger_ids)
+                )
+            )
         )
 
         return set(session.scalars(query))

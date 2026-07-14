@@ -97,27 +97,26 @@ def test_trigger_team_name_stored(session, testing_team):
     assert loaded.team_name == "testing"
 
 
-def test_fetch_trigger_ids_with_non_task_associations(session):
-    # Create triggers
+@pytest.mark.parametrize("association_type", ["asset", "callback"])
+def test_fetch_trigger_ids_with_non_task_associations_filters_trigger_ids(session, association_type):
     asset_trigger = Trigger(classpath="airflow.triggers.testing.SuccessTrigger1", kwargs={})
     callback_trigger = Trigger(classpath="airflow.triggers.testing.SuccessTrigger2", kwargs={})
     other_trigger = Trigger(classpath="airflow.triggers.testing.SuccessTrigger3", kwargs={})
     session.add_all([asset_trigger, callback_trigger, other_trigger])
     session.commit()
 
-    # Create callback association
     callback = TriggererCallback(callback_def=AsyncCallback("classpath.log.error"))
     callback.trigger = callback_trigger
     session.add(callback)
 
-    # Create asset association
     asset = AssetModel("test")
     asset.add_trigger(asset_trigger, "test_asset_watcher")
     session.add(asset)
 
     session.commit()
-    results = Trigger.fetch_trigger_ids_with_non_task_associations()
-    assert results == {asset_trigger.id, callback_trigger.id}
+    selected_trigger = asset_trigger if association_type == "asset" else callback_trigger
+    results = Trigger.fetch_trigger_ids_with_non_task_associations({selected_trigger.id, other_trigger.id})
+    assert results == {selected_trigger.id}
 
 
 def test_clean_unused(session, dag_maker):
