@@ -73,12 +73,17 @@ Variable                                    Type                  Description
                                              | ``None``
 ``{{ inlets }}``                            list                  List of inlets declared on the task.
 ``{{ inlet_events }}``                      dict[str, ...]        Access past events of inlet assets. See :doc:`Assets <authoring-and-scheduling/asset-scheduling>`. Added in version 2.10.
+``{{ asset_state_store }}``                 Asset state accessor  | Access persistent state scoped to the task's inlet and outlet assets.
+                                                                  | Provides accessors for concrete assets resolved from the task's declared inlets and outlets.
+                                                                  | See :doc:`Asset state store <core-concepts/asset-state-store>`. Added in version 3.3.
 ``{{ outlets }}``                           list                  List of outlets declared on the task.
 ``{{ outlet_events }}``                     dict[str, ...]        | Accessors to attach information to asset events that will be emitted by the current task.
                                                                   | See :doc:`Assets <authoring-and-scheduling/asset-scheduling>`. Added in version 2.10.
 ``{{ dag }}``                               DAG                   The currently running :class:`~airflow.models.dag.DAG`. You can read more about Dags in :doc:`Dags <core-concepts/dags>`.
 ``{{ task }}``                              BaseOperator          | The currently running :class:`~airflow.models.baseoperator.BaseOperator`. You can read more about Tasks in :doc:`core-concepts/operators`
 ``{{ task_reschedule_count }}``             int                   How many times current task has been rescheduled. Relevant to ``mode="reschedule"`` sensors.
+``{{ task_state_store }}``                  Task state accessor   | Access persistent state scoped to the current task instance.
+                                                                  | See :doc:`Task state store <core-concepts/task-state-store>`. Added in version 3.3.
 ``{{ macros }}``                                                  | A reference to the macros package. See Macros_ below.
 ``{{ task_instance }}``                     TaskInstance          The currently running :class:`~airflow.models.taskinstance.TaskInstance`.
 ``{{ ti }}``                                TaskInstance          Same as ``{{ task_instance }}``.
