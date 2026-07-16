@@ -550,6 +550,16 @@ class BaseExecutor(LoggingMixin):
 
         return cleared_events
 
+    def requeue_events(self, events: dict[WorkloadKey, EventBufferValueType]) -> None:
+        """
+        Return events to the buffer without replacing newer events for the same workload.
+
+        Executors overriding :meth:`get_event_buffer` to aggregate another executor's events must also
+        override this method to return events to their original buffer.
+        """
+        for key, event in events.items():
+            self.event_buffer.setdefault(key, event)
+
     def get_task_log(self, ti: TaskInstance, try_number: int) -> tuple[list[str], list[str]]:
         """
         Return the task logs.

@@ -52,6 +52,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import joinedload, lazyload, load_only, make_transient, selectinload
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.sql import expression
 
 from airflow import settings
@@ -141,9 +142,9 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.selectable import Subquery
 
     from airflow._shared.logging.types import Logger
-    from airflow.executors.base_executor import BaseExecutor
+    from airflow.executors.base_executor import BaseExecutor, EventBufferValueType
     from airflow.executors.executor_utils import ExecutorName
-    from airflow.executors.workloads.types import SchedulerWorkload
+    from airflow.executors.workloads.types import SchedulerWorkload, WorkloadKey
     from airflow.serialization.definitions.dag import SerializedDAG
     from airflow.utils.sqlalchemy import CommitProhibitorGuard
 
@@ -1253,17 +1254,94 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
     def _is_tracing_enabled():
         return conf.getboolean("traces", "otel_on")
 
-    def _process_executor_events(self, executor: BaseExecutor, session: Session) -> int:
+    def _process_executor_events(
+        self,
+        executor: BaseExecutor,
+        session: Session,
+        *,
+        event_buffer: dict[WorkloadKey, EventBufferValueType] | None = None,
+        emit_metrics: bool = True,
+    ) -> int:
         try:
             return SchedulerJobRunner.process_executor_events(
                 executor=executor,
                 job_id=self.job.id,
                 scheduler_dag_bag=self.scheduler_dag_bag,
                 session=session,
+                event_buffer=event_buffer,
+                emit_metrics=emit_metrics,
             )
+        except Exception as exc:
+            if emit_metrics:
+                stats.incr("scheduler.executor_events.failed", tags={"exception_class": type(exc).__name__})
+            raise
+
+    def _process_executor_events_with_retries(self) -> int:
+        """Retry callback events until committed, without replaying task-event side effects."""
+        event_buffers: list[
+            tuple[
+                BaseExecutor,
+                dict[WorkloadKey, EventBufferValueType],
+                dict[WorkloadKey, EventBufferValueType],
+            ]
+        ] = []
+        num_callback_events = 0
+        try:
+            for executor in self.executors:
+                remaining_events = executor.get_event_buffer()
+                callback_events: dict[WorkloadKey, EventBufferValueType] = {
+                    key: remaining_events.pop(key)
+                    for key in list(remaining_events)
+                    if isinstance(key, CallbackKey)
+                }
+                num_callback_events += len(callback_events)
+                event_buffers.append((executor, callback_events, remaining_events))
+
+            if num_callback_events:
+                for attempt in run_with_db_retries(logger=self.log):
+                    with attempt:
+                        with create_session() as session:
+                            for executor, callback_events, _ in event_buffers:
+                                self._process_executor_events(
+                                    executor=executor,
+                                    session=session,
+                                    event_buffer=callback_events.copy(),
+                                    emit_metrics=False,
+                                )
+        except (DBAPIError, StaleDataError) as exc:
+            for executor, callback_events, remaining_events in event_buffers:
+                executor.requeue_events(callback_events | remaining_events)
+            stats.incr("scheduler.executor_events.failed", tags={"exception_class": type(exc).__name__})
+            self.log.exception("Failed to commit executor callback events; retrying in the next loop")
+            return 0
+        except Exception as exc:
+            for executor, callback_events, remaining_events in event_buffers:
+                executor.requeue_events(callback_events | remaining_events)
+            stats.incr("scheduler.executor_events.failed", tags={"exception_class": type(exc).__name__})
+            raise
+
+        if num_callback_events:
+            for _, callback_events, _ in event_buffers:
+                if callback_events:
+                    self._emit_executor_events_batch_metrics(len(callback_events))
+
+        num_finished_events = 0
+        try:
+            with create_session() as session:
+                for executor, _, remaining_events in event_buffers:
+                    num_finished_events += self._process_executor_events(
+                        executor=executor,
+                        session=session,
+                        event_buffer=remaining_events.copy(),
+                        emit_metrics=False,
+                    )
         except Exception as exc:
             stats.incr("scheduler.executor_events.failed", tags={"exception_class": type(exc).__name__})
             raise
+
+        for _, _, remaining_events in event_buffers:
+            self._emit_executor_events_batch_metrics(len(remaining_events))
+        return num_finished_events
 
     @staticmethod
     def _emit_executor_events_batch_metrics(num_events: int) -> None:
@@ -1272,7 +1350,14 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
     @classmethod
     def process_executor_events(
-        cls, executor: BaseExecutor, job_id: int | None, scheduler_dag_bag: DBDagBag, session: Session
+        cls,
+        executor: BaseExecutor,
+        job_id: int | None,
+        scheduler_dag_bag: DBDagBag,
+        session: Session,
+        *,
+        event_buffer: dict[WorkloadKey, EventBufferValueType] | None = None,
+        emit_metrics: bool = True,
     ) -> int:
         """
         Process task completion events from the executor and update task instance states.
@@ -1295,6 +1380,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         :param job_id: The scheduler job ID, used to detect task requeuing by other schedulers
         :param scheduler_dag_bag: Serialized DAG bag for retrieving task definitions
         :param session: Database session for task instance updates
+        :param event_buffer: Optional pre-drained event batch used for transaction retries
+        :param emit_metrics: Whether to emit batch metrics before returning
 
         :return: Number of events processed from the executor event buffer
 
@@ -1305,7 +1392,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         executors as well.
         """
         ti_primary_key_to_try_number_map: dict[tuple[str, str, str, int], int] = {}
-        event_buffer = executor.get_event_buffer()
+        if event_buffer is None:
+            event_buffer = executor.get_event_buffer()
         num_events = len(event_buffer)
         tis_with_right_state: list[TaskInstanceKey] = []
         callback_keys_with_events: list[CallbackKey] = []
@@ -1368,13 +1456,15 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
         # Return if no finished tasks
         if not tis_with_right_state:
-            cls._emit_executor_events_batch_metrics(num_events)
+            if emit_metrics:
+                cls._emit_executor_events_batch_metrics(num_events)
             return len(event_buffer)
 
         # Check state of finished tasks
         filter_for_tis = TI.filter_for_tis(tis_with_right_state)
         if filter_for_tis is None:
-            cls._emit_executor_events_batch_metrics(num_events)
+            if emit_metrics:
+                cls._emit_executor_events_batch_metrics(num_events)
             return len(event_buffer)
         asset_loader, alias_loader = _eager_load_dag_run_for_validation()
         query = (
@@ -1602,7 +1692,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 # Update task state - emails are handled by DAG processor now
                 ti.handle_failure(error=msg, session=session)
 
-        cls._emit_executor_events_batch_metrics(num_events)
+        if emit_metrics:
+            cls._emit_executor_events_batch_metrics(num_events)
         return len(event_buffer)
 
     def _execute(self) -> int | None:
@@ -1807,12 +1898,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     ):
                         executor.heartbeat()
 
-                with create_session() as session:
-                    num_finished_events = 0
-                    for executor in self.executors:
-                        num_finished_events += self._process_executor_events(
-                            executor=executor, session=session
-                        )
+                num_finished_events = self._process_executor_events_with_retries()
 
                 for executor in self.executors:
                     try:

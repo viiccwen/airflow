@@ -35,9 +35,11 @@ from uuid import UUID, uuid4
 import pendulum
 import psutil
 import pytest
+import tenacity
 import time_machine
 from sqlalchemy import delete, func, inspect, select, update
 from sqlalchemy.dialects import mysql
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import joinedload
 
 from airflow import settings
@@ -69,7 +71,7 @@ from airflow.models.asset import (
     PartitionedAssetKeyLog,
 )
 from airflow.models.backfill import Backfill, BackfillDagRun, ReprocessBehavior, _create_backfill
-from airflow.models.callback import Callback, ExecutorCallback
+from airflow.models.callback import Callback, CallbackKey, ExecutorCallback
 from airflow.models.connection_test import (
     ConnectionTestKey,
     ConnectionTestRequest,
@@ -470,6 +472,124 @@ class TestSchedulerJob:
         assert total_runs_val >= num_runs, "Total loop count should be at least num_runs"
         assert idle_runs_val == num_runs, "Scheduler exits when idle run count reaches num_runs"
         assert total_runs_val > idle_runs_val, "Some runs should not be idle"
+
+    @pytest.mark.parametrize(
+        "failed_commits",
+        [
+            pytest.param(1, id="retry_succeeds"),
+            pytest.param(2, id="next_loop_succeeds"),
+        ],
+    )
+    def test_executor_callback_events_retained_until_transaction_commits(
+        self,
+        dag_maker,
+        session,
+        mocker,
+        failed_commits,
+    ):
+        def callback_function():
+            pass
+
+        with dag_maker(dag_id=f"executor_event_commit_{failed_commits}"):
+            pass
+        dag_run = dag_maker.create_dagrun()
+        callback = Deadline(
+            deadline_time=timezone.utcnow(),
+            callback=SyncCallback(callback_function),
+            dagrun_id=dag_run.id,
+            deadline_alert_id=None,
+        ).callback
+        callback.state = CallbackState.QUEUED
+        callback.data["dag_run_id"] = dag_run.id
+        callback.data["dag_id"] = dag_run.dag_id
+        session.add(callback)
+        session.commit()
+        callback_id = callback.id
+
+        executor = MockExecutor(do_update=False)
+        second_executor = MockExecutor(do_update=False)
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor, second_executor])
+        event_key = CallbackKey(id=str(callback_id))
+        event = (CallbackState.SUCCESS, None)
+        executor.event_buffer[event_key] = event
+        connection_event_key = ConnectionTestKey(id=str(uuid4()))
+        connection_event = (ConnectionTestState.SUCCESS, None)
+        executor.event_buffer[connection_event_key] = connection_event
+        second_connection_event_key = ConnectionTestKey(id=str(uuid4()))
+        second_connection_event = (ConnectionTestState.SUCCESS, None)
+        second_executor.event_buffer[second_connection_event_key] = second_connection_event
+        newer_second_connection_event = (ConnectionTestState.FAILED, "new result")
+
+        actual_create_session = create_session
+        commit_attempts = 0
+
+        @contextmanager
+        def create_flaky_session():
+            nonlocal commit_attempts
+            with actual_create_session(scoped=False) as event_session:
+                actual_commit = event_session.commit
+
+                def flaky_commit():
+                    nonlocal commit_attempts
+                    commit_attempts += 1
+                    if commit_attempts <= failed_commits:
+                        if commit_attempts == failed_commits == 2:
+                            second_executor.event_buffer[second_connection_event_key] = (
+                                newer_second_connection_event
+                            )
+                        raise OperationalError("commit", {}, Exception("simulated commit failure"))
+                    actual_commit()
+
+                mocker.patch.object(event_session, "commit", side_effect=flaky_commit)
+                yield event_session
+
+        retrying = tenacity.Retrying(
+            retry=tenacity.retry_if_exception_type(OperationalError),
+            stop=tenacity.stop_after_attempt(2),
+            wait=tenacity.wait_none(),
+            reraise=True,
+        )
+        mocker.patch("airflow.jobs.scheduler_job_runner.create_session", side_effect=create_flaky_session)
+        mocker.patch("airflow.jobs.scheduler_job_runner.run_with_db_retries", return_value=retrying)
+        mock_stats = mocker.patch("airflow.jobs.scheduler_job_runner.stats")
+
+        num_finished_events = self.job_runner._process_executor_events_with_retries()
+
+        session.expire_all()
+        callback = session.get(ExecutorCallback, callback_id)
+        if failed_commits == 2:
+            assert commit_attempts == 2
+            assert executor.event_buffer == {
+                event_key: event,
+                connection_event_key: connection_event,
+            }
+            assert second_executor.event_buffer == {
+                second_connection_event_key: newer_second_connection_event
+            }
+            assert callback.state == CallbackState.QUEUED
+            assert num_finished_events == 0
+            num_finished_events = self.job_runner._process_executor_events_with_retries()
+            session.expire_all()
+            callback = session.get(ExecutorCallback, callback_id)
+
+        assert commit_attempts == failed_commits + 2
+        assert num_finished_events == 2
+        assert executor.event_buffer == {}
+        assert second_executor.event_buffer == {}
+        assert callback.state == CallbackState.SUCCESS
+        assert [
+            call
+            for call in mock_stats.incr.call_args_list
+            if call.args[0] == "scheduler.executor_events.processed"
+        ] == [
+            mock.call("scheduler.executor_events.processed", 1),
+            mock.call("scheduler.executor_events.processed", 1),
+            mock.call("scheduler.executor_events.processed", 1),
+        ]
+        assert sum(
+            call.args[0] == "scheduler.executor_events.failed" for call in mock_stats.incr.call_args_list
+        ) == (failed_commits == 2)
 
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest")
     @mock.patch("airflow._shared.observability.metrics.stats._get_backend")

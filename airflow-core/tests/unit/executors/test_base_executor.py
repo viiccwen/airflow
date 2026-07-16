@@ -107,9 +107,22 @@ def test_get_event_buffer():
     executor.event_buffer[key2] = state, None
     executor.event_buffer[key3] = state, None
 
-    assert len(executor.get_event_buffer(("my_dag1",))) == 1
-    assert len(executor.get_event_buffer()) == 2
+    dag1_events = executor.get_event_buffer(("my_dag1",))
+    remaining_events = executor.get_event_buffer()
+
+    assert len(dag1_events) == 1
+    assert len(remaining_events) == 2
     assert len(executor.event_buffer) == 0
+
+    newer_event = (State.RUNNING, "new executor info")
+    executor.event_buffer[key2] = newer_event
+    executor.requeue_events(dag1_events | remaining_events)
+
+    assert executor.get_event_buffer() == {
+        key1: (state, None),
+        key2: newer_event,
+        key3: (state, None),
+    }
 
 
 def test_get_event_buffer_always_includes_callback_keys():
